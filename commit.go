@@ -258,8 +258,10 @@ func (p *commitPipeline) Commit(b *Batch, syncWAL bool) error {
 		panic(err)
 	}
 
-	// Publish the batch sequence number.
-	p.publish(b)
+	// Wait for the batch to be synced.
+	if syncWAL {
+		b.commit.Wait()
+	}
 
 	<-p.sem
 	return nil
@@ -276,6 +278,8 @@ func (p *commitPipeline) AllocateSeqNum(prepare func(), apply func(seqNum uint64
 	// This method is similar to Commit and prepare. Be careful about trying to
 	// share additional code with those methods because Commit and prepare are
 	// performance critical code paths.
+
+	panic("TODO(peter): broken with unordered writes")
 
 	b := newBatch(nil)
 	defer b.release()
@@ -326,23 +330,14 @@ func (p *commitPipeline) prepare(b *Batch, syncWAL bool) (*memTable, error) {
 	if n == invalidBatchCount {
 		return nil, ErrInvalidBatch
 	}
-	count := 1
-	if syncWAL {
-		count++
-	}
-	b.commit.Add(count)
 
 	var syncWG *sync.WaitGroup
 	if syncWAL {
+		b.commit.Add(1)
 		syncWG = &b.commit
 	}
 
 	p.mu.Lock()
-
-	// Enqueue the batch in the pending queue. Note that while the pending queue
-	// is lock-free, we want the order of batches to be the same as the sequence
-	// number order.
-	p.pending.enqueue(b)
 
 	// Assign the batch a sequence number.
 	b.setSeqNum(*p.env.logSeqNum)
@@ -350,6 +345,9 @@ func (p *commitPipeline) prepare(b *Batch, syncWAL bool) (*memTable, error) {
 
 	// Write the data to the WAL.
 	mem, err := p.env.write(b, syncWG)
+
+	newSeqNum := b.seqNum() + uint64(b.count())
+	atomic.StoreUint64(p.env.visibleSeqNum, newSeqNum)
 
 	p.mu.Unlock()
 
